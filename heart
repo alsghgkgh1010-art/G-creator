@@ -6,7 +6,7 @@
     <title>오늘의 마음 날씨</title>
     <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Inter 폰트 적용 -->
+    <!-- Inter 폰트 적용 -->sdfsdfsdfsdfsdf
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
         body {
