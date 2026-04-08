@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>오늘의 마음 날씨</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter 폰트 적용 -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f4f8; /* 배경색 */
+        }
+        .emotion-button {
+            transition: transform 0.2s ease-in-out;
+        }
+        .emotion-button:hover {
+            transform: scale(1.1);
+        }
+        .emotion-button.selected {
+            border: 3px solid #6366f1; /* 선택된 감정 테두리 색상 */
+            box-shadow: 0 0 15px rgba(99, 102, 241, 0.5); /* 선택된 감정 그림자 */
+        }
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .spinner {
+            border: 8px solid #f3f3f3; /* Light grey */
+            border-top: 8px solid #3498db; /* Blue */
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        /* 감정 그래프 바 스타일 */
+        .chart-bar {
+            height: 20px;
+            margin-bottom: 5px;
+            border-radius: 5px;
+            transition: width 0.5s ease-in-out;
+        }
+    </style>
+</head>
+<body class="p-6">
+    <div id="loadingOverlay" class="loading-overlay hidden">
+        <div class="spinner"></div>
+        <p id="loadingMessage" class="text-xl text-gray-700">로딩 중...</p>
+    </div>
+
+    <!-- Firebase SDK (9.x 이상) -->
+    <script type="module">
+        // Firebase 앱 초기화 및 서비스 가져오기
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, addDoc, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // 전역 변수 선언 (나중에 사용)
+        let app;
+        let db;
+        let auth;
+        let userId = ''; // 사용자 ID
+
+        // 앱 ID 및 Firebase 설정 가져오기
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            const loadingOverlay = document.getElementById('loadingOverlay');
+            const loadingMessage = document.getElementById('loadingMessage');
+            loadingOverlay.classList.remove('hidden'); // 로딩 화면 표시
+            loadingMessage.textContent = '앱 초기화 중...';
+
+            // Firebase 초기화
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            // 인증 상태 변경 감지
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    console.log("인증 완료, User ID:", userId);
+                    document.getElementById('userIdDisplay').textContent = `사용자 ID: ${userId}`;
+                    await loadDiaryEntries(userId); // 일기 데이터 로드
+                    await setupRealtimeListener(userId); // 실시간 리스너 설정
+                } else {
+                    // 사용자 토큰이 없으면 익명 로그인 시도
+                    if (initialAuthToken) {
+                        try {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                            console.log("초기 토큰으로 로그인 성공");
+                        } catch (error) {
+                            console.error("초기 토큰으로 로그인 실패:", error);
+                            await signInAnonymously(auth);
+                            console.log("익명 로그인 성공");
+                        }
+                    } else {
+                        await signInAnonymously(auth);
+                        console.log("익명 로그인 성공");
+                    }
+                }
+                loadingOverlay.classList.add('hidden'); // 로딩 화면 숨김
+            });
+
+            // DOM 요소 가져오기
+            const emotionButtons = document.querySelectorAll('.emotion-button');
+            const gradeInput = document.getElementById('gradeInput'); // 학년 입력 필드
+            const nameInput = document.getElementById('nameInput');     // 이름 입력 필드
+            const diaryTextarea = document.getElementById('diaryTextarea');
+            const saveDiaryBtn = document.getElementById('saveDiaryBtn');
+            const emotionFeedbackDiv = document.getElementById('emotionFeedback');
+            const diaryEntriesList = document.getElementById('diaryEntries');
+            const emotionGraphCanvas = document.getElementById('emotionGraph');
+            const emergencyKitContent = document.getElementById('emergencyKitContent');
+
+            let selectedEmotion = ''; // 선택된 감정
+            let currentDiaryDate = new Date().toISOString().slice(0, 10); // 오늘 날짜 (YYYY-MM-DD)
+
+            // 감정 버튼 클릭 이벤트
+            emotionButtons.forEach(button => {
+                button.addEventListener('click', () => {
+                    emotionButtons.forEach(btn => btn.classList.remove('selected')); // 기존 선택 해제
+                    button.classList.add('selected'); // 새 감정 선택
+                    selectedEmotion = button.dataset.emotion; // 선택된 감정 저장
+                    console.log("선택된 감정:", selectedEmotion);
+
+                    // 감정 응급 키트 업데이트
+                    updateEmergencyKit(selectedEmotion);
+
+                    // 일기장 내용 초기화 (새로운 감정 선택 시)
+                    diaryTextarea.value = '';
+                    emotionFeedbackDiv.textContent = '';
+                });
+            });
+
+            // 일기 저장 버튼 클릭 이벤트
+            saveDiaryBtn.addEventListener('click', async () => {
+                const grade = gradeInput.value.trim();
+                const name = nameInput.value.trim();
+
+                if (!selectedEmotion) {
+                    showCustomAlert("감정을 먼저 선택해주세요! 😊");
+                    return;
+                }
+                if (!grade) {
+                    showCustomAlert("학년을 입력해주세요! 🏫");
+                    return;
+                }
+                if (!name) {
+                    showCustomAlert("이름을 입력해주세요! 🧑‍🎓");
+                    return;
+                }
+                const diaryContent = diaryTextarea.value.trim();
+                if (!diaryContent) {
+                    showCustomAlert("일기 내용을 작성해주세요!");
+                    return;
+                }
+
+                const entry = {
+                    emotion: selectedEmotion,
+                    content: diaryContent,
+                    timestamp: new Date().toISOString(),
+                    date: currentDiaryDate, // YYYY-MM-DD 형식으로 저장
+                    grade: grade, // 학년 추가
+                    name: name    // 이름 추가
+                };
+
+                try {
+                    // Firestore에 일기 저장 (private data)
+                    const docRef = doc(db, `artifacts/${appId}/users/${userId}/emotion_diary`, currentDiaryDate);
+                    await setDoc(docRef, entry); // 같은 날짜면 덮어쓰기
+                    showCustomAlert("일기가 성공적으로 저장되었어요! ✨");
+
+                    // 저장 후 필드 초기화
+                    selectedEmotion = '';
+                    diaryTextarea.value = '';
+                    emotionButtons.forEach(btn => btn.classList.remove('selected'));
+                    // gradeInput.value = ''; // 학년은 매번 입력하지 않도록 유지하거나 필요에 따라 초기화
+                    // nameInput.value = '';   // 이름도 매번 입력하지 않도록 유지하거나 필요에 따라 초기화
+
+                } catch (e) {
+                    console.error("일기 저장 실패: ", e);
+                    showCustomAlert("일기 저장에 실패했어요. 다시 시도해주세요. 😭");
+                }
+            });
+
+            // 사용자 일기 데이터 로드 함수
+            async function loadDiaryEntries(currentUserId) {
+                if (!currentUserId) return;
+                try {
+                    const q = collection(db, `artifacts/${appId}/users/${currentUserId}/emotion_diary`);
+                    const querySnapshot = await getDocs(q);
+                    const entries = [];
+                    querySnapshot.forEach((doc) => {
+                        entries.push(doc.data());
+                    });
+                    displayDiaryEntries(entries);
+                    analyzeEmotionPatterns(entries);
+                } catch (e) {
+                    console.error("일기 데이터 로드 실패: ", e);
+                }
+            }
+
+            // 실시간 리스너 설정
+            async function setupRealtimeListener(currentUserId) {
+                if (!currentUserId) return;
+                const q = collection(db, `artifacts/${appId}/users/${currentUserId}/emotion_diary`);
+                onSnapshot(q, (snapshot) => {
+                    const entries = [];
+                    snapshot.forEach((doc) => {
+                        entries.push(doc.data());
+                    });
+                    displayDiaryEntries(entries);
+                    analyzeEmotionPatterns(entries);
+                });
+            }
+
+            // 일기 목록 표시 함수
+            function displayDiaryEntries(entries) {
+                diaryEntriesList.innerHTML = ''; // 기존 목록 초기화
+                // 날짜별로 그룹화 및 정렬
+                const groupedEntries = entries.reduce((acc, entry) => {
+                    const date = entry.date;
+                    if (!acc[date]) {
+                        acc[date] = [];
+                    }
+                    acc[date].push(entry);
+                    return acc;
+                }, {});
+
+                // 날짜(키)를 내림차순으로 정렬
+                const sortedDates = Object.keys(groupedEntries).sort((a, b) => new Date(b) - new Date(a));
+
+                sortedDates.forEach(date => {
+                    const dateHeader = document.createElement('h3');
+                    dateHeader.className = "text-lg font-semibold mt-4 text-indigo-700";
+                    dateHeader.textContent = date;
+                    diaryEntriesList.appendChild(dateHeader);
+
+                    groupedEntries[date].forEach(entry => {
+                        const listItem = document.createElement('div');
+                        listItem.className = "p-4 border rounded-lg shadow-sm mb-2 bg-white";
+                        // 학년과 이름도 표시
+                        listItem.innerHTML = `
+                            <div class="flex items-center mb-2">
+                                <span class="text-3xl mr-2">${getEmotionEmoji(entry.emotion)}</span>
+                                <span class="font-bold text-gray-800">${entry.emotion}</span>
+                                <span class="ml-auto text-sm text-gray-500">${new Date(entry.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}</span>
+                            </div>
+                            <p class="text-gray-700 mb-2"><strong>학년:</strong> ${entry.grade} &nbsp; <strong>이름:</strong> ${entry.name}</p>
+                            <p class="text-gray-700">${entry.content}</p>
+                        `;
+                        diaryEntriesList.appendChild(listItem);
+                    });
+                });
+            }
+
+            // 감정 패턴 분석 및 그래프 생성 함수
+            function analyzeEmotionPatterns(entries) {
+                const emotionCounts = { '기쁨': 0, '슬픔': 0, '화남': 0, '평온': 0, '궁금': 0 };
+                let totalEntries = 0;
+
+                // 최근 한 달 데이터만 사용
+                const oneMonthAgo = new Date();
+                oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+                const recentEntries = entries.filter(entry => new Date(entry.timestamp) >= oneMonthAgo);
+
+                if (recentEntries.length === 0) {
+                    emotionFeedbackDiv.textContent = "아직 기록된 감정이 없네요! 감정을 기록하고 패턴을 확인해보세요. ✨";
+                    emotionGraphCanvas.innerHTML = ''; // 그래프 초기화
+                    return;
+                }
+
+                recentEntries.forEach(entry => {
+                    if (emotionCounts.hasOwnProperty(entry.emotion)) {
+                        emotionCounts[entry.emotion]++;
+                        totalEntries++;
+                    }
+                });
+
+                // 감정 그래프 업데이트
+                emotionGraphCanvas.innerHTML = ''; // 기존 그래프 삭제
+                for (const emotion in emotionCounts) {
+                    const count = emotionCounts[emotion];
+                    const percentage = totalEntries > 0 ? (count / totalEntries) * 100 : 0;
+
+                    // 백분율이 0%보다 클 경우에만 막대기 생성
+                    if (percentage > 0) {
+                        const barContainer = document.createElement('div');
+                        barContainer.className = "flex items-center mb-2";
+
+                        const label = document.createElement('span');
+                        label.className = "w-20 text-gray-700";
+                        label.textContent = `${emotion}:`;
+                        barContainer.appendChild(label);
+
+                        const bar = document.createElement('div');
+                        bar.className = `chart-bar flex-grow rounded-lg ${getEmotionColorClass(emotion)}`;
+                        bar.style.width = `${percentage}%`;
+                        barContainer.appendChild(bar);
+
+                        const percentageText = document.createElement('span');
+                        percentageText.className = "ml-2 text-gray-600";
+                        percentageText.textContent = `${percentage.toFixed(1)}%`;
+                        barContainer.appendChild(percentageText);
+
+                        emotionGraphCanvas.appendChild(barContainer);
+                    }
+                }
+
+
+                // 정서적 피드백 생성
+                const sortedEmotions = Object.entries(emotionCounts).sort(([, a], [, b]) => b - a);
+                const mostFrequentEmotion = sortedEmotions[0][0];
+
+                let feedbackMessage = "";
+                if (totalEntries > 0) {
+                    switch (mostFrequentEmotion) {
+                        case '기쁨':
+                            feedbackMessage = `이번 달에는 ${mostFrequentEmotion} 감정을 많이 느끼셨네요! 즐겁고 행복한 순간들이 가득했나 봐요! 😊`;
+                            break;
+                        case '슬픔':
+                            feedbackMessage = `이번 달에는 ${mostFrequentEmotion} 감정을 많이 느끼셨군요. 힘들었던 일은 없었는지 돌아볼까요? 괜찮아요, 우리가 함께 있으니 힘내세요! 💙`;
+                            break;
+                        case '화남':
+                            feedbackMessage = `이번 달에는 ${mostFrequentEmotion} 감정을 많이 느끼셨네요. 혹시 불편한 일이 있었을까요? 감정 응급 키트를 활용해 보세요! ❤️‍🩹`;
+                            break;
+                        case '평온':
+                            feedbackMessage = `이번 달에는 ${mostFrequentEmotion} 감정을 많이 느끼셨네요. 마음이 편안하고 안정적인 한 달을 보내셨군요! 😌`;
+                            break;
+                        case '궁금':
+                            feedbackMessage = `이번 달에는 ${mostFrequentEmotion} 감정을 많이 느끼셨네요. 새로운 것을 배우고 탐구하는 즐거움이 가득했나 봐요! 🤔`;
+                            break;
+                        default:
+                            feedbackMessage = "다양한 감정들을 느끼셨네요. 모든 감정은 소중해요! ✨";
+                    }
+                } else {
+                    feedbackMessage = "아직 기록된 감정이 없네요! 감정을 기록하고 패턴을 확인해보세요. ✨";
+                }
+                emotionFeedbackDiv.textContent = feedbackMessage;
+            }
+
+            // 감정 이모티콘 반환 함수
+            function getEmotionEmoji(emotion) {
+                switch (emotion) {
+                    case '기쁨': return '😄';
+                    case '슬픔': return '😥';
+                    case '화남': return '😠';
+                    case '평온': return '😌';
+                    case '궁금': return '🤔';
+                    default: return '❓';
+                }
+            }
+
+            // 감정별 색상 클래스 반환 함수 (그래프 바)
+            function getEmotionColorClass(emotion) {
+                switch (emotion) {
+                    case '기쁨': return 'bg-green-400';
+                    case '슬픔': return 'bg-blue-400';
+                    case '화남': return 'bg-red-400';
+                    case '평온': return 'bg-purple-400';
+                    case '궁금': return 'bg-yellow-400';
+                    default: return 'bg-gray-400';
+                }
+            }
+
+            // 감정 응급 키트 내용 업데이트
+            function updateEmergencyKit(emotion) {
+                let kitHtml = '';
+                switch (emotion) {
+                    case '화남':
+                        kitHtml = `
+                            <p class="text-gray-700 mb-2">화나는 감정이 들 때 해보면 좋아요!</p>
+                            <ul class="list-disc list-inside text-gray-600">
+                                <li>심호흡하는 방법: 숨을 크게 들이쉬고 천천히 내쉬어 보세요. 🌬️</li>
+                                <li>10초 동안 눈 감고 있기: 잠시 모든 생각에서 벗어나 쉬어보세요. 🧘‍♀️</li>
+                                <li>종이에 화나는 그림 그리기: 그림으로 감정을 표현해 보세요. 🎨</li>
+                                <li>좋아하는 음악 듣기: 마음을 편안하게 해주는 음악을 들어보세요. 🎶</li>
+                            </ul>
+                        `;
+                        break;
+                    case '슬픔':
+                        kitHtml = `
+                            <p class="text-gray-700 mb-2">슬픈 감정이 들 때 해보면 좋아요!</p>
+                            <ul class="list-disc list-inside text-gray-600">
+                                <li>따뜻한 차 마시기: 몸을 따뜻하게 해주면 마음도 편안해져요. ☕</li>
+                                <li>친구에게 이야기하기: 믿을 수 있는 친구나 선생님에게 마음을 털어놓아 보세요. 🗣️</li>
+                                <li>좋아하는 그림책 보기: 마음이 따뜻해지는 이야기를 읽어보세요. 📚</li>
+                                <li>푹신한 이불 덮고 쉬기: 잠시 휴식을 취하는 것도 좋아요. 🛌</li>
+                            </ul>
+                        `;
+                        break;
+                    case '궁금':
+                        kitHtml = `
+                            <p class="text-gray-700 mb-2">궁금한 감정이 들 때 해보면 좋아요!</p>
+                            <ul class="list-disc list-inside text-gray-600">
+                                <li>궁금한 것을 찾아보기: 도서관이나 인터넷에서 궁금증을 해결해 보세요. 🔍</li>
+                                <li>질문하기: 궁금한 것을 선생님이나 부모님께 물어보세요. 💬</li>
+                                <li>새로운 것을 탐험하기: 주변을 둘러보며 새로운 것들을 발견해 보세요. 🗺️</li>
+                                <li>상상해보기: 궁금한 것에 대해 자유롭게 상상해 보세요. 💭</li>
+                            </ul>
+                        `;
+                        break;
+                    default:
+                        kitHtml = '<p class="text-gray-600">선택된 감정에 대한 응급 키트가 여기에 나타납니다.</p>';
+                }
+                emergencyKitContent.innerHTML = kitHtml;
+            }
+
+            // 맞춤형 알림창 함수 (alert 대신 사용)
+            function showCustomAlert(message) {
+                const alertDiv = document.createElement('div');
+                alertDiv.className = 'fixed inset-0 flex items-center justify-center bg-black bg-opacity-50 z-50';
+                alertDiv.innerHTML = `
+                    <div class="bg-white p-6 rounded-lg shadow-xl max-w-sm w-full text-center">
+                        <p class="text-lg font-semibold mb-4 text-gray-800">${message}</p>
+                        <button id="alertCloseBtn" class="bg-indigo-500 text-white px-4 py-2 rounded-md hover:bg-indigo-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50">확인</button>
+                    </div>
+                `;
+                document.body.appendChild(alertDiv);
+
+                document.getElementById('alertCloseBtn').addEventListener('click', () => {
+                    document.body.removeChild(alertDiv);
+                });
+            }
+
+            // 초기 감정 응급 키트 로드
+            updateEmergencyKit(''); // 기본 메시지 표시
+        });
+    </script>
+
+    <div class="max-w-4xl mx-auto bg-white p-8 rounded-xl shadow-lg border border-indigo-100">
+        <h1 class="text-4xl font-extrabold text-center text-indigo-700 mb-8 tracking-tight">오늘의 마음 날씨 🌈</h1>
+        <p id="userIdDisplay" class="text-sm text-center text-gray-500 mb-6"></p>
+
+        <!-- 감정 기록 섹션 -->
+        <div class="mb-10 p-6 bg-indigo-50 rounded-lg shadow-inner">
+            <h2 class="text-2xl font-bold text-indigo-800 mb-5">✔️ 내 마음 기록하기</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                    <label for="gradeInput" class="block text-sm font-medium text-gray-700 mb-1">학년</label>
+                    <input type="text" id="gradeInput" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-400 focus:border-transparent" placeholder="예: 3학년">
+                </div>
+                <div>
+                    <label for="nameInput" class="block text-sm font-medium text-gray-700 mb-1">이름</label>
+                    <input type="text" id="nameInput" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-400 focus:border-transparent" placeholder="예: 김코딩">
+                </div>
+            </div>
+            <div class="flex flex-wrap justify-center gap-4 mb-6">
+                <button class="emotion-button p-4 rounded-full bg-white border-2 border-transparent shadow-md hover:shadow-lg transition-all duration-200" data-emotion="기쁨">
+                    <span class="text-5xl">😄</span>
+                    <p class="text-sm font-medium text-gray-700 mt-1">기쁨</p>
+                </button>
+                <button class="emotion-button p-4 rounded-full bg-white border-2 border-transparent shadow-md hover:shadow-lg transition-all duration-200" data-emotion="슬픔">
+                    <span class="text-5xl">😥</span>
+                    <p class="text-sm font-medium text-gray-700 mt-1">슬픔</p>
+                </button>
+                <button class="emotion-button p-4 rounded-full bg-white border-2 border-transparent shadow-md hover:shadow-lg transition-all duration-200" data-emotion="화남">
+                    <span class="text-5xl">😠</span>
+                    <p class="text-sm font-medium text-gray-700 mt-1">화남</p>
+                </button>
+                <button class="emotion-button p-4 rounded-full bg-white border-2 border-transparent shadow-md hover:shadow-lg transition-all duration-200" data-emotion="평온">
+                    <span class="text-5xl">😌</span>
+                    <p class="text-sm font-medium text-gray-700 mt-1">평온</p>
+                </button>
+                <button class="emotion-button p-4 rounded-full bg-white border-2 border-transparent shadow-md hover:shadow-lg transition-all duration-200" data-emotion="궁금">
+                    <span class="text-5xl">🤔</span>
+                    <p class="text-sm font-medium text-gray-700 mt-1">궁금</p>
+                </button>
+            </div>
+            <textarea id="diaryTextarea" class="w-full p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-400 focus:border-transparent resize-y min-h-[120px] mb-4" placeholder="오늘 있었던 일과 내 감정을 이야기해 주세요. 📝 (그림을 그리고 싶다면 종이에 그린 후 이곳에 설명해 보아요!)"></textarea>
+            <button id="saveDiaryBtn" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg shadow-md hover:bg-indigo-700 transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50">✨ 마음 저장하기 ✨</button>
+        </div>
+
+        <!-- 감정 패턴 분석 섹션 -->
+        <div class="mb-10 p-6 bg-purple-50 rounded-lg shadow-inner">
+            <h2 class="text-2xl font-bold text-purple-800 mb-5">📊 내 마음 날씨 살펴보기</h2>
+            <div id="emotionGraph" class="mb-4 bg-white p-4 rounded-lg border border-purple-200">
+                <!-- 감정 그래프가 여기에 생성됩니다. -->
+                <p class="text-gray-600">감정을 기록하면 여기에 나의 마음 날씨가 보여요!</p>
+            </div>
+            <p id="emotionFeedback" class="text-lg text-center font-semibold text-purple-700 bg-purple-100 p-3 rounded-md border border-purple-300">
+                <!-- 정서적 피드백 메시지가 여기에 나타납니다. -->
+            </p>
+        </div>
+
+        <!-- 감정 조절 팁 섹션 -->
+        <div class="mb-10 p-6 bg-teal-50 rounded-lg shadow-inner">
+            <h2 class="text-2xl font-bold text-teal-800 mb-5">💖 감정 응급 키트</h2>
+            <div id="emergencyKitContent" class="bg-white p-4 rounded-lg border border-teal-200">
+                <!-- 감정 조절 팁이 여기에 나타납니다. -->
+            </div>
+        </div>
+
+        <!-- 지난 일기 기록 섹션 -->
+        <div class="p-6 bg-gray-50 rounded-lg shadow-inner">
+            <h2 class="text-2xl font-bold text-gray-800 mb-5">📜 지난 내 마음 기록</h2>
+            <div id="diaryEntries" class="space-y-3">
+                <p class="text-gray-600">아직 기록된 일기가 없어요. 첫 일기를 작성해 보세요! 📖</p>
+                <!-- 일기 목록이 여기에 표시됩니다. -->
+            </div>
+        </div>
+    </div>
+</body>
+</html>
